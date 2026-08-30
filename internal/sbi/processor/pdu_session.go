@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/free5gc/aper"
+	"github.com/free5gc/ngap/ngapType"
 	"github.com/nycu-ucr/gonet/http"
 
 	"github.com/nycu-ucr/gin"
@@ -665,8 +667,30 @@ func (p *Processor) HandlePDUSessionSMContextUpdate(
 		smContext.CheckState(smf_context.Active)
 		smContext.SetState(smf_context.ModificationPending)
 
-		if smContext.NrdcIndicator {
-			smContext.Log.Infof("Both tunnels are active - Tunnel TEID: %d, DCTunnel TEID: %d",
+		// The transition is driven by the message, not by current state:
+		// an indication carrying AdditionalDLQosFlowPerTNLInformation asks
+		// for the secondary tunnel (1->2); one without it asks for release
+		// (2->1). A request that matches the current state is a no-op that
+		// still gets a confirm so the RAN is not left waiting.
+		dcExtPresent := false
+		{
+			var ind ngapType.PDUSessionResourceModifyIndicationTransfer
+			if errDecode := aper.UnmarshalWithParams(body.BinaryDataN2SmInformation, &ind, "valueExt"); errDecode == nil &&
+				ind.AdditionalDLQosFlowPerTNLInformation != nil && len(ind.AdditionalDLQosFlowPerTNLInformation.List) > 0 {
+				dcExtPresent = true
+			}
+		}
+
+		switch {
+		case smContext.NrdcIndicator && dcExtPresent:
+			smContext.Log.Warnln("Modify indication carries a DC tunnel but DC is already active; " +
+				"repointing is done via PathSwitchRequest - no-op")
+			sendPFCPModification = false
+		case !smContext.NrdcIndicator && !dcExtPresent:
+			smContext.Log.Infoln("Modify indication without DC tunnel while DC inactive - no-op")
+			sendPFCPModification = false
+		case smContext.NrdcIndicator && !dcExtPresent:
+			smContext.Log.Infof("Both tunnels are active - Tunnel TEID: %d, DCTunnel TEID: %d; releasing DCTunnel",
 				smContext.Tunnel.ANInformation.TEID, smContext.DCTunnel.ANInformation.TEID)
 
 			// avtivate the rules for specified QoS traffic on Tunnel
@@ -686,13 +710,16 @@ func (p *Processor) HandlePDUSessionSMContextUpdate(
 				}
 			}
 
-			// remove the rules on DCTunnel
+			// remove the rules on DCTunnel - all of them. In hash-steered
+			// (static/PathSwitch-established) NR-DC the secondary leg's DL PDR
+			// is the default-match rule at precedence 255, so the former
+			// precedence filter left the DC FAR installed at the UPF.
 			for _, dataPath := range dcTunnel.DataPathPool {
 				if dataPath.Activated {
 					ANUPF := dataPath.FirstDPNode
 					ULPDR := ANUPF.UpLinkTunnel.PDR
 					DLPDR := ANUPF.DownLinkTunnel.PDR
-					if DLPDR.Precedence == 255 {
+					if ULPDR == nil || DLPDR == nil || ULPDR.FAR == nil || DLPDR.FAR == nil {
 						continue
 					}
 
@@ -709,14 +736,15 @@ func (p *Processor) HandlePDUSessionSMContextUpdate(
 				}
 			}
 
-			// re-initialize DCTunnel
-			smf_context.ReleaseTEID(dcTunnel.ANInformation.TEID)
+			// re-initialize DCTunnel. The DL TEID in ANInformation is
+			// RAN-allocated and must NOT be returned to the SMF's TEID pool;
+			// LocalULTeidForSplitPDUSession is per-session and reused.
 			smContext.DCTunnel = smf_context.NewUPTunnel()
 			smContext.NrdcIndicator, sendPFCPModification = false, true
 
 			smContext.Log.Infoln("Release DCTunnel")
-		} else {
-			smContext.Log.Infof("Only master tunnel is active - Tunnel TEID: %d", smContext.Tunnel.ANInformation.TEID)
+		case !smContext.NrdcIndicator && dcExtPresent:
+			smContext.Log.Infof("Only master tunnel is active - Tunnel TEID: %d; activating DCTunnel", smContext.Tunnel.ANInformation.TEID)
 
 			// handle the PDU session resource modify indication transfer message
 			if err = smf_context.
@@ -792,27 +820,23 @@ func (p *Processor) HandlePDUSessionSMContextUpdate(
 
 		if sendPFCPModification {
 			smContext.SetState(smf_context.PFCPModification)
-			if smContext.NrdcIndicator {
-				response.BinaryDataN2SmInformation, err = smf_context.
-					BuildPDUSessionResourceModifyConfirmTransfer(smContext, smContext.DCTunnel)
-				if err != nil {
-					smContext.Log.Errorf("Build PDUSessionResourceModifyConfirmSuccess failed: %+v", err)
-				} else {
-					response.JsonData.N2SmInfo = &models.RefToBinaryData{ContentId: "PDU_RES_MOD_CFM"}
-					response.JsonData.N2SmInfoType = models.N2SmInfoType_PDU_RES_MOD_CFM
-				}
-			} else {
-				response.BinaryDataN2SmInformation, err = smf_context.
-					BuildPDUSessionResourceModifyConfirmTransfer(smContext, smContext.Tunnel)
-				if err != nil {
-					smContext.Log.Errorf("Build PDUSessionResourceModifyConfirmSuccess failed: %+v", err)
-				} else {
-					response.JsonData.N2SmInfo = &models.RefToBinaryData{ContentId: "PDU_RES_MOD_CFM"}
-					response.JsonData.N2SmInfoType = models.N2SmInfoType_PDU_RES_MOD_CFM
-				}
-			}
 		} else {
 			smContext.SetState(smf_context.Active)
+		}
+
+		// Always answer with a confirm transfer (also for no-op requests):
+		// the AMF builds the NGAP confirm from it and fails on an empty item.
+		confirmTunnel := smContext.Tunnel
+		if smContext.NrdcIndicator {
+			confirmTunnel = smContext.DCTunnel
+		}
+		response.BinaryDataN2SmInformation, err = smf_context.
+			BuildPDUSessionResourceModifyConfirmTransfer(smContext, confirmTunnel)
+		if err != nil {
+			smContext.Log.Errorf("Build PDUSessionResourceModifyConfirmSuccess failed: %+v", err)
+		} else {
+			response.JsonData.N2SmInfo = &models.RefToBinaryData{ContentId: "PDU_RES_MOD_CFM"}
+			response.JsonData.N2SmInfoType = models.N2SmInfoType_PDU_RES_MOD_CFM
 		}
 	case models.N2SmInfoType_PDU_RES_REL_RSP:
 		// remove an tunnel info

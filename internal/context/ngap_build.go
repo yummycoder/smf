@@ -19,7 +19,6 @@ func BuildPDUSessionResourceSetupRequestTransfer(ctx *SMContext) ([]byte, error)
 	teidOctForSplitPDUSession := make([]byte, 4)
 	binary.BigEndian.PutUint32(teidOct, ctx.LocalULTeid)
 	binary.BigEndian.PutUint32(teidOctForSplitPDUSession, ctx.LocalULTeidForSplitPDUSession)
- 
 
 	resourceSetupRequestTransfer := ngapType.PDUSessionResourceSetupRequestTransfer{}
 
@@ -102,7 +101,6 @@ func BuildPDUSessionResourceSetupRequestTransfer(ctx *SMContext) ([]byte, error)
 		}
 	}
 	resourceSetupRequestTransfer.ProtocolIEs.List = append(resourceSetupRequestTransfer.ProtocolIEs.List, ie)
-
 
 	// PDU Session Type
 	ie = ngapType.PDUSessionResourceSetupRequestTransferIEs{}
@@ -283,6 +281,27 @@ func BuildPDUSessionResourceModifyConfirmTransfer(ctx *SMContext, tunnel *UPTunn
 				})
 			}
 		}
+	}
+
+	// QosFlowModifyConfirmList is SEQUENCE (SIZE(1..maxnoofQosFlows)): in
+	// hash-steered NR-DC every flow on the tunnel is the default flow
+	// (precedence 255), which the loop above deliberately skips - so the
+	// list would be empty and the encoder rejects it. Confirm the default
+	// flow's QFI in that case.
+	if len(qosList.List) == 0 {
+		defaultQfi := int64(1)
+		if dp := tunnel.DataPathPool.GetDefaultPath(); dp != nil && dp.FirstDPNode != nil &&
+			dp.FirstDPNode.DownLinkTunnel != nil && dp.FirstDPNode.DownLinkTunnel.PDR != nil {
+			for _, qer := range dp.FirstDPNode.DownLinkTunnel.PDR.QER {
+				if qer != nil {
+					defaultQfi = int64(qer.QFI.QFI)
+					break
+				}
+			}
+		}
+		qosList.List = append(qosList.List, ngapType.QosFlowModifyConfirmItem{
+			QosFlowIdentifier: ngapType.QosFlowIdentifier{Value: defaultQfi},
+		})
 	}
 
 	// UL NG-U UP TNL Information — use the tunnel's actual UL TEID
