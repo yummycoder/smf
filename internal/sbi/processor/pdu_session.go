@@ -763,10 +763,6 @@ func (p *Processor) HandlePDUSessionSMContextUpdate(
 							ANUPF := dataPath.FirstDPNode
 							ULPDR := ANUPF.UpLinkTunnel.PDR
 							DLPDR := ANUPF.DownLinkTunnel.PDR
-							if DLPDR.Precedence == 255 {
-								continue
-							}
-
 							ULPDR.FAR.ApplyAction = pfcpType.ApplyAction{
 								Buff: false,
 								Drop: false,
